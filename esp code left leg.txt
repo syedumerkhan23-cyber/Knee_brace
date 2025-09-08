@@ -1,0 +1,1077 @@
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPAsyncTCP.h>
+#include <math.h>
+#include <EEPROM.h>
+#include <Servo.h>
+
+#define EEPROM_ADDR_PITCH1 0
+#define EEPROM_ADDR_ROLL1 4
+#define EEPROM_ADDR_PITCH2 8
+#define EEPROM_ADDR_ROLL2 12
+#define EEPROM_CALIBRATED 16
+
+Servo servo1;
+Servo servo2;
+
+const int servo1Pin = 14;
+const int servo2Pin = 12;
+
+//WIFI credentials
+const char* ssid = "Inoter";
+const char* password = "12345678";
+
+// Access Point credentials
+const char* apSSID = "Knee-Brace";
+const char* apPassword = "44448888";
+
+const uint8_t MPU1_ADDR = 0x68;
+const uint8_t MPU2_ADDR = 0x69;
+
+bool motorLocked;
+
+bool impactDetected = false;
+unsigned long impactTime = 0;
+
+float pry1[3] = { 0, 0, 0 };
+float pry2[3] = { 0, 0, 0 };
+
+float temperature1 = 0, temperature2 = 0;
+
+float gyroX1 = 0, gyroY1 = 0;
+float gyroX2 = 0, gyroY2 = 0;
+
+float pitchOffset1 = 0, rollOffset1 = 0;
+float pitchOffset2 = 0, rollOffset2 = 0;
+bool calibrated = false;
+
+float prevPitch1 = 0, prevRoll1 = 0;
+float prevPitch2 = 0, prevRoll2 = 0;
+
+float cumulativePitch1 = 0, cumulativeRoll1 = 0;
+float cumulativePitch2 = 0, cumulativeRoll2 = 0;
+
+int clientCount = 0;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+unsigned long lastSend = 0;
+
+void saveCalibrationToEEPROM() {
+  EEPROM.begin(20);
+  EEPROM.put(EEPROM_ADDR_PITCH1, pitchOffset1);
+  EEPROM.put(EEPROM_ADDR_ROLL1, rollOffset1);
+  EEPROM.put(EEPROM_ADDR_PITCH2, pitchOffset2);
+  EEPROM.put(EEPROM_ADDR_ROLL2, rollOffset2);
+  EEPROM.write(EEPROM_CALIBRATED, 1);  // 1 means true
+  EEPROM.commit();
+  Serial.println("Calibration saved to EEPROM.");
+}
+void loadCalibrationFromEEPROM() {
+  EEPROM.begin(20);
+  if (EEPROM.read(EEPROM_CALIBRATED) == 1) {
+    EEPROM.get(EEPROM_ADDR_PITCH1, pitchOffset1);
+    EEPROM.get(EEPROM_ADDR_ROLL1, rollOffset1);
+    EEPROM.get(EEPROM_ADDR_PITCH2, pitchOffset2);
+    EEPROM.get(EEPROM_ADDR_ROLL2, rollOffset2);
+    calibrated = true;
+    cumulativePitch1 = 0;
+    cumulativeRoll1 = 0;
+    cumulativePitch2 = 0;
+    cumulativeRoll2 = 0;
+
+    prevPitch1 = 0;
+    prevRoll1 = 0;
+    prevPitch2 = 0;
+    prevRoll2 = 0;
+    Serial.println("Calibration loaded from EEPROM.");
+  } else {
+    Serial.println("No calibration found in EEPROM.");
+  }
+}
+void clearEEPROMCalibration() {
+  EEPROM.begin(20);
+  EEPROM.write(EEPROM_CALIBRATED, 0);
+  EEPROM.commit();
+  Serial.println("EEPROM calibration cleared.");
+}
+float unwrapAngle(float current, float previous) {
+  float delta = current - previous;
+  if (delta > 180.0) delta -= 360.0;
+  else if (delta < -180.0) delta += 360.0;
+  return delta;
+}
+
+// Kalman Filter Class
+class SimpleKalman {
+  float q, r, x, p, k;
+public:
+  SimpleKalman(float processNoise, float measurementNoise, float estimatedError = 1.15, float initialValue = 0.0) {
+    q = processNoise;
+    r = measurementNoise;
+    p = estimatedError;
+    x = initialValue;
+  }
+  float update(float measurement) {
+    p += q;
+    k = p / (p + r);
+    x += k * (measurement - x);
+    p *= (1 - k);
+    return x;
+  }
+  void setEstimate(float value) {
+    x = value;
+  }
+  float getEstimate() const {
+    return x;
+  }
+};
+
+float pullTo90(float angle, float start = 75.0, float end = 90) {
+  if (abs(angle) < start) return angle;
+  float sign = (angle > 0) ? 1.0 : -1.0;
+  float ratio = (abs(angle) - start) / (end - start);
+  ratio = constrain(ratio, 0.0, 1.0);
+  float pushed = abs(angle) + ratio * (90.0 - abs(angle));
+  return pushed * sign;
+}
+
+float pullToZero(float value, float start = 5.0, float end = 0) {
+  float absVal = abs(value);
+  if (absVal <= end || absVal >= start) return value;
+
+  float ratio = (start - absVal) / (start - end);
+  return value * (1.0 - ratio);
+}
+// SimpleKalman (mea_e,est_e)
+//Lower mea_e means you trust the sensor more (less smoothing).
+//Higher est_e means you trust the filter more (more smoothing).
+SimpleKalman kalmanPitch1(0.04, 5.8);
+SimpleKalman kalmanRoll1(0.04, 5.8);
+SimpleKalman kalmanPitch2(0.04, 5.8);
+SimpleKalman kalmanRoll2(0.04, 5.8);
+
+void setupMPU(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  // Set gyro sensitivity
+  Wire.beginTransmission(addr);
+  Wire.write(0x1B);
+  Wire.write(0X08);
+  Wire.endTransmission(true);
+
+  // Set accelerometer
+  Wire.beginTransmission(addr);
+  Wire.write(0x1C);  // ACCEL_CONFIG
+  Wire.write(0x08);  // frequency
+  Wire.endTransmission(true);
+
+  //Set DLPF (CONFIG register)
+  Wire.beginTransmission(addr);
+  Wire.write(0x1A);
+  Wire.write(0x03);
+  Wire.endTransmission(true);
+}
+
+void readMPU(uint8_t addr, float* pry, float* gyro) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x3B);  // ACCEL_XOUT_H
+  Wire.endTransmission(false);
+  if (Wire.requestFrom(addr, (uint8_t)14) != 14) {
+    Serial.printf("Failed to read MPU at 0x%X\n", addr);
+    return;
+  }
+
+  int16_t AcX = Wire.read() << 8 | Wire.read();
+  int16_t AcY = Wire.read() << 8 | Wire.read();
+  int16_t AcZ = Wire.read() << 8 | Wire.read();
+  int16_t tempRaw = (Wire.read() << 8 | Wire.read());
+  int16_t GyX = Wire.read() << 8 | Wire.read();
+  int16_t GyY = Wire.read() << 8 | Wire.read();
+
+  float norm = sqrt(AcX * AcX + AcY * AcY + AcZ * AcZ);
+  float ax = (float)AcX / norm;
+  float ay = (float)AcY / norm;
+  float az = (float)AcZ / norm;
+
+  float ax_g = (float)AcX / 8192.0;
+  float ay_g = (float)AcY / 8192.0;
+  float az_g = (float)AcZ / 8192.0;
+
+  gyro[0] = (float)GyX / 65.5;
+  gyro[1] = (float)GyY / 65.5;
+
+  float accPitch = atan2(-ax, sqrt(ay * ay + az * az)) * RAD_TO_DEG;
+  float accRoll = atan2(ay, sqrt(ax * ax + az * az)) * RAD_TO_DEG;
+
+  if (!calibrated) {
+    accPitch = constrain(pullTo90(accPitch), -90.0, 90.0);
+    accRoll = constrain(pullTo90(accRoll), -90.0, 90.0);
+    accPitch = pullToZero(accPitch);
+    accRoll = pullToZero(accRoll);
+
+    if (abs(accPitch) >= 89.4) accPitch = (accPitch > 0) ? 90.0 : -90.0;
+    if (abs(accRoll) >= 89.4) accRoll = (accRoll > 0) ? 90.0 : -90.0;
+
+    if (abs(accPitch) <= 0.25) accPitch = 0;
+    if (abs(accRoll) <= 0.25) accRoll = 0;
+  }
+
+  pry[0] = accRoll;
+  pry[1] = accPitch;
+
+  float tempC = tempRaw / 340.0 + 36.53;
+  if (addr == MPU1_ADDR) temperature1 = tempC;
+  else temperature2 = tempC;
+}
+
+void updateSensor() {
+  float gyro1[2], gyro2[2];  // [0]=GyroX (Roll), [1]=GyroY (Pitch)
+
+  readMPU(MPU1_ADDR, pry1, gyro1);
+  readMPU(MPU2_ADDR, pry2, gyro2);
+
+  gyroX1 = gyro1[0];
+  gyroY1 = gyro1[1];
+  gyroX2 = gyro2[0];
+  gyroY2 = gyro2[1];
+
+  // IMPACT DETECTION
+  float maxGyro = max(max(abs(gyroX1), abs(gyroY1)), max(abs(gyroX2), abs(gyroY2)));
+  if (!impactDetected && maxGyro > 450.0) {
+    impactDetected = true;
+    impactTime = millis();
+    Serial.println("IMPACT DETECTED!");
+  }
+  // Auto-clear after 2 seconds
+  if (impactDetected && millis() - impactTime > 2500) {
+    impactDetected = false;
+    Serial.println("Impact cleared");
+  }
+  // Apply Kalman smoothing
+  float rawRoll1 = kalmanRoll1.update(pry1[0]);
+  float rawPitch1 = kalmanPitch1.update(pry1[1]);
+  float rawRoll2 = kalmanRoll2.update(pry2[0]);
+  float rawPitch2 = kalmanPitch2.update(pry2[1]);
+
+  if (calibrated) {
+    float correctedPitch1 = rawPitch1 - pitchOffset1;
+    float correctedRoll1 = rawRoll1 - rollOffset1;
+    float correctedPitch2 = rawPitch2 - pitchOffset2;
+    float correctedRoll2 = rawRoll2 - rollOffset2;
+
+    float deltaPitch1 = unwrapAngle(correctedPitch1, prevPitch1);
+    float deltaRoll2 = unwrapAngle(correctedRoll2, prevRoll2);
+    float deltaRoll1 = unwrapAngle(correctedRoll1, prevRoll1);
+    float deltaPitch2 = unwrapAngle(correctedPitch2, prevPitch2);
+
+    cumulativePitch1 += deltaPitch1;
+    cumulativeRoll2 += deltaRoll2;
+    cumulativeRoll1 += deltaRoll1;
+    cumulativePitch2 += deltaPitch2;
+
+    prevPitch1 = correctedPitch1;
+    prevRoll2 = correctedRoll2;
+    prevRoll1 = correctedRoll1;
+    prevPitch2 = correctedPitch2;
+
+    pry1[1] = correctedPitch1;
+    pry1[0] = correctedRoll1;
+    pry2[1] = correctedPitch2;
+    pry2[0] = correctedRoll2;
+
+  } else {
+    // In uncalibrated mode: use raw smoothed data
+    cumulativePitch1 = rawPitch1;
+    cumulativeRoll1 = rawRoll1;
+    cumulativePitch2 = rawPitch2;
+    cumulativeRoll2 = rawRoll2;
+
+    prevPitch1 = rawPitch1;
+    prevRoll1  = rawRoll1;
+    prevPitch2 = rawPitch2;
+    prevRoll2  = rawRoll2;
+
+    pry1[1] = rawPitch1;
+    pry1[0] = rawRoll1;
+    pry2[1] = rawPitch2;
+    pry2[0] = rawRoll2;
+  }
+}
+
+void notifyClients() {
+  String json = "{";
+  json += "\"pitch1\":" + String(pry1[1], 2) + ",";
+  json += "\"roll1\":" + String(pry1[0], 2) + ",";
+  json += "\"pitch2\":" + String(pry2[1], 2) + ",";
+  json += "\"roll2\":" + String(pry2[0], 2) + ",";
+  json += "\"rawPitch1\":" + String(kalmanPitch1.getEstimate(), 2) + ",";
+  json += "\"rawRoll1\":" + String(kalmanRoll1.getEstimate(), 2) + ",";
+  json += "\"cumulativePitch1\":" + String(cumulativePitch1, 2) + ",";
+  json += "\"cumulativeRoll1\":" + String(cumulativeRoll1, 2) + ",";
+  json += "\"cumulativePitch2\":" + String(cumulativePitch2, 2) + ",";
+  json += "\"cumulativeRoll2\":" + String(cumulativeRoll2, 2) + ",";
+  json += "\"pitchOffset1\":" + String(pitchOffset1, 2) + ",";
+  json += "\"temp1\":" + String(temperature1, 2) + ",";
+  json += "\"temp2\":" + String(temperature2, 2) + ",";
+  json += "\"useCalibrated\":" + String(calibrated) + ",";
+  json += "\"motorLocked\":" + String(motorLocked) + ",";
+  json += "\"impactDetected\":" + String(impactDetected);
+  json += "}";
+  ws.textAll(json);
+}
+void calibrateOffsets() {
+  // Reset Kalman filters with current raw readings
+  float rawRoll1 = pry1[0];
+  float rawPitch1 = pry1[1];
+  float rawRoll2 = pry2[0];
+  float rawPitch2 = pry2[1];
+
+  kalmanRoll1.setEstimate(rawRoll1);
+  kalmanPitch1.setEstimate(rawPitch1);
+  kalmanRoll2.setEstimate(rawRoll2);
+  kalmanPitch2.setEstimate(rawPitch2);
+
+  // Set new offset reference
+  rollOffset1 = kalmanRoll1.getEstimate();
+  pitchOffset1 = kalmanPitch1.getEstimate();
+  rollOffset2 = kalmanRoll2.getEstimate();
+  pitchOffset2 = kalmanPitch2.getEstimate();
+
+  // Reset cumulative angles
+  cumulativePitch1 = 0;
+  cumulativeRoll1 = 0;
+  cumulativePitch2 = 0;
+  cumulativeRoll2 = 0;
+
+  prevPitch1 = 0;
+  prevRoll1 = 0;
+  prevPitch2 = 0;
+  prevRoll2 = 0;
+
+  calibrated = true;
+  saveCalibrationToEEPROM();
+
+  Serial.println("Calibration complete! Kalman reset, offsets saved.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.setClock(50000);  // 100kHz is safest for i2c clock
+  Wire.begin(4, 5);
+  setupMPU(MPU1_ADDR);
+  setupMPU(MPU2_ADDR);
+  servo1.attach(servo1Pin, 500, 2000);
+  servo2.attach(servo2Pin, 500, 2000);
+  servo1.write(90);  // Neutral starting position
+  servo2.write(90);
+  delay(500);
+  
+  // Detach initially
+  servo1.detach();
+  servo2.detach();
+  motorLocked = false;
+  Serial.println("Motors are unlocked at startup.");
+
+  loadCalibrationFromEEPROM();
+
+  // Start both STA + AP mode
+  WiFi.mode(WIFI_AP_STA);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long timeout = 5000;  // 10 seconds timeout
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi!");
+    Serial.println("\nWiFi connected. IP address:");
+    Serial.println(WiFi.localIP());
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(apSSID, apPassword);
+    Serial.print("AP IP (for direct connect): ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("\nWiFi connection FAILED!");
+    Serial.println("Starting Hotspot");
+
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apSSID, apPassword);
+
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Knee Brace</title>
+  <style>
+    body { font-family: Arial; text-align: center; background: linear-gradient(145deg, #6835e8 0%, #57C7FF 85%); color: white; }
+    .sensor-section { background: rgba(0, 0, 0, 0.35); margin: 10px auto; padding: 15px; border-radius: 10px; width: 80%; max-width: 400px; flex: 1 1 250px; border: 2px solid #629AF4}
+    .sensor-container {display: flex; justify-content: center; flex-wrap: wrap; gap:10px;margin: 10px auto;max-width: 900px;}
+    #floatBtn {
+      position: fixed; bottom: 28px; left: 28px; z-index: 9999;
+      background: linear-gradient(145deg, #050860, #0a0f99); color: #fff; border: none; border-radius: 50%;
+      width: 42px; height: 42px; font-size: 24px; box-shadow: 0 2px 10px #0006;
+      cursor: pointer; transition: background 0.2s;
+    }
+    #floatBtn:hover { background: rgba(0, 0, 0, 0.35); }
+    #chartWindow {
+      background: rgba(0, 0, 0, 0.35); max-width: 900px;
+      border-radius: 16px; box-shadow: 0 6px 24px #0008; border: 2px solid #629AF4;
+      z-index: 9998; justify-content: center; margin: auto; display: none; user-select: none;
+      width: 100%; height: 100%;
+    }
+    #chartHeader {
+      background: rgba(0, 0, 0, 0.35); color: #fff; padding: 12px; cursor: move;
+      border-radius: 16px 16px 0 0; font-weight: bold; font-family: monospace;
+      letter-spacing: 1px; display: flex; justify-content: space-between; align-items: center;
+    }
+    #closeChart {
+      background: none; border: none; color: #fff; font-size: 22px; cursor: pointer; margin-left: 10px;
+    }
+    #chartBody {
+      padding: 10px 10px 4px 10px; background: #222e; border-radius: 0 0 16px 16px;
+    }
+    #chart {
+      width: 100%;
+      height: 210px;
+      min-width: 120px;
+      min-height: 80px;
+      display: block;
+      margin: auto;
+    }
+    .value-box {
+      background: #291F33BF;
+      padding: 2px 8px;
+      border-radius: 12px;
+      display: inline-block;
+    }
+    .legend {
+      margin-bottom: 6px; font-size: 13px; font-family: monospace; display: flex; gap: 10px;
+    }
+    .legend span { display: flex; align-items: center; gap: 3px; }
+    .dot { width: 14px; height: 6px; border-radius: 4px; display: inline-block; }
+    .dot1 { background: #00ff66; } /* pitch1 */
+    .dot2 { background: #F0E384; } /* roll1 */
+    .dot3 { background: #ff9900; } /* pitch2 */
+    .dot4 { background: #ff54c0; } /* roll2 */
+    p { color: white; font-size: 1.2em; } span { font-weight: bold; }
+    @keyframes flash {
+    0%   { background-color: rgba(0, 0, 0, 0.35); color:#EEEEEE; }
+    50%  { background-color: rgba(255, 0, 0, 0.85); color:#FFC300; }
+    100% { background-color: rgba(0, 0, 0, 0.35); color:#EEEEEE; }
+  }
+  #impactAlert.flash {
+    animation: flash 1s infinite;
+  }
+    #refreshBtn,
+    #recBtn,
+    #downloadBtn,
+    #clearBtn,
+    #calibrateBtn{
+      padding: 10px 20px;
+      font-size: 12px;
+      margin: 8px 5px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      background: linear-gradient(145deg, #050860, #0a0f99);
+      color: #ffffff;
+
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.6),
+                  -2px -2px 6px rgba(255,255,255,0.05);
+      transition: all 0.2s ease-in-out;
+    }
+    #refreshBtn:hover,
+    #recBtn:hover,
+    #clearBtn:hover,
+    #calibrateBtn:hover,
+    #recBtn.recording:hover{
+      background: linear-gradient(145deg, #0a0f99, #1a1aff);
+      transform: scale(1.05);
+    }
+    #refreshBtn:active,
+    #recBtn:active,
+    #clearBtn:active,
+    #floatBtn:active{
+      transform: scale(0.97);
+      box-shadow: inset 2px 2px 6px rgba(0,0,0,0.6),
+                  inset -2px -2px 6px rgba(255,255,255,0.05);
+    }
+    #calibrateBtn.calibrated,
+    #downloadBtn{
+      background: linear-gradient(145deg, #1e8449, #196f3d);
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.5),
+                  -2px -2px 6px rgba(255,255,255,0.05);
+      transition: all 0.2s ease-in-out;
+    } 
+    #downloadBtn:hover,
+    #calibrateBtn.calibrated:hover{
+      background: linear-gradient(145deg, #1e8449, #196f3d);
+      transform: scale(1.05);
+    }
+    #lockBtn {
+      padding: 10px 20px;
+      font-size: 12px;
+      margin: 8px 5px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      color: #ffffff;
+      transition: all 0.4s ease-in-out;
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.6),
+                  -2px -2px 6px rgba(255,255,255,0.05);
+      transition: all 0.2s ease-in-out;
+    }
+
+    #lockBtn.unlocked {
+      background: linear-gradient(145deg, #2ecc71, #27ae60);
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.5),
+                  -2px -2px 6px rgba(255,255,255,0.05);
+    }
+    #lockBtn.unlocked:hover {
+      background: linear-gradient(145deg, #1e8449, #196f3d);
+      transform: scale(1.05);
+    }
+
+    #lockBtn.locked{
+      background: linear-gradient(145deg, #e74c3c, #c0392b);
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.5),
+                  -2px -2px 6px rgba(255,255,255,0.05);
+    }
+    #lockBtn.locked:hover {
+      background: linear-gradient(145deg, #922b21, #7b231a);
+      transform: scale(1.05);
+    }
+
+    #lockBtn:active,
+    #downloadBtn:active,
+    #calibrateBtn.calibrated:active{
+      transform: scale(0.97);
+      box-shadow: inset 2px 2px 6px rgba(0,0,0,0.6),
+                  inset -2px -2px 6px rgba(255,255,255,0.05);
+    }
+    #hardResetBtn {
+    background: linear-gradient(145deg, #5a1f1f, #3d1414);
+    color: #fff;
+    padding: 10px 20px;
+    font-size: 12px;
+    margin-top: 20px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease-in-out;
+    box-shadow: 2px 2px 5px #1a0a0a, 
+              -2px -2px 5px #702a2a;
+  }
+
+  #hardResetBtn:hover {
+    background: linear-gradient(145deg, #e74c3c, #c0392b);
+  }
+
+  #hardResetBtn:active {
+    background: linear-gradient(145deg, #ff1a1a, #cc0000);
+    transform: scale(0.90);
+  }
+  #recBtn.recording{
+    background: linear-gradient(145deg, #214270, #40ADA9);
+    color: black;
+    transform: scale(0.96);
+    box-shadow: 2px 2px 6px rgba(0,0,0,0.6),
+              -2px -2px 6px rgba(255,255,255,0.05);
+    border: 2px solid #050860;
+    border-radius: 8px;
+  }
+  </style>
+</head>
+<body>
+<div style="
+  position: absolute;
+  top: 0px;
+  right: 0px;
+  font-size: 9px;
+  color: white;
+  background-color: rgba(0, 0, 0, 0);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: sans-serif;
+">
+<u>Knee Brace v1.2 Left leg module</u>
+</div>
+  <h1>Sensors Data</h1>
+   <div class="sensor-container">
+    <div class="sensor-section">
+    <h3><b>Thigh readings</b></h3>
+    <p style="color:#FFFFFF"><u>Pitch-Y:</u><span id="pitch1" class="value-box" style="color:#00ff66">--</span>&deg;</p>
+    <p style="color:#FFFFFF"><u>Roll-X: </u><span id="roll1" class="value-box" style="color:#F0E384">--</span>&deg;</p>
+  </div>
+  <div class="sensor-section">
+    <h3><b>Shin readings</b></h3>
+    <p style="color:#FFFFFF"><u>Pitch-Y: </u><span id="pitch2" class="value-box" style="color:#ff9900">--</span>&deg;</p>
+    <p style="color:#FFFFFF"><u>Roll-X: </u><span id="roll2" class="value-box" style="color:#ff54c0">--</span>&deg;</p>
+   </div>
+  </div>
+  <div style="position:fixed; bottom:10px; right:10px; font-size:12px; background:#00000088; padding:5px 10px; border-radius:5px;">
+  Temp1: <span id="temp1">--</span> °C<br>
+  Temp2: <span id="temp2">--</span> °C
+  </div>
+    <div id="chartWindow">
+    <div id="chartHeader">
+      Live Pitch & Roll Chart
+      <button id="closeChart" title="Close">&#10006</button>
+    </div>
+    <div id="chartBody">
+      <div class="legend">
+        <span><span class="dot dot1"></span>pitch1</span>
+        <span><span class="dot dot2"></span>roll1</span>
+        <span><span class="dot dot3"></span>pitch2</span>
+        <span><span class="dot dot4"></span>roll2</span>
+      </div>
+      <canvas id="chart"></canvas>
+    </div>
+  </div>
+  <button id="recBtn" onclick="toggleRecording()" style="padding:10px 20px; font-size:10px; margin-top:20px;">Start Recording &#9205</button>
+  <button id="downloadBtn" onclick="downloadCSV()" style="padding:10px 20px; font-size:10px; margin-top:20px; display:none;">Download CSV</button>
+  <button id="calibrateBtn" onclick="sendCalibration()" style="padding:10px 20px; font-size:10px; margin-top:20px;">Calibrate to 0</button>
+  <button id="clearBtn"
+        style="padding:10px 20px; font-size:10px;">
+  Reset & Clear Calibration
+  </button>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      const clearBtn = document.getElementById("clearBtn");
+
+      clearBtn.addEventListener("click", function() {
+        // Clear charts safely
+        if (typeof pitch1 !== "undefined") pitch1.clear();
+        if (typeof roll1 !== "undefined") roll1.clear();
+        if (typeof pitch2 !== "undefined") pitch2.clear();
+        if (typeof roll2 !== "undefined") roll2.clear();
+
+        // Notify backend to reset calibration
+        if (typeof socket !== "undefined" && socket.readyState === WebSocket.OPEN) {
+          socket.send('clearCalibration');
+        }
+      });
+    });
+  </script>
+    <button id="refreshBtn" style="padding:10px 20px; font-size:10px; margin-top:20px;">
+    Refresh &orarr;
+    </button>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      const refreshBtn = document.getElementById("refreshBtn");
+      refreshBtn.addEventListener("click", function() {
+        location.reload();
+      });
+    });
+  </script> 
+  <button id="lockBtn" onclick="toggleLock()" style="padding:10px 20px; font-size:10px; margin-top:20px;"> Locked </button>
+  <button id="floatBtn" title="Show Live Chart">&#128508</button>
+  <button id="hardResetBtn" onclick="confirmHardReset()" style="padding:10px 20px; font-size:10px; margin-top:20px;">Hard Reset &circleddash;</button>
+  <script>
+    function confirmHardReset() {
+      if (confirm("Are you sure you want to reboot the device ?")) {
+        document.getElementById("hardResetBtn").innerText = "Rebooting...";
+        socket.send("hardReset");
+      }
+    }
+  </script>
+  <div id="impactAlert" class="" style="display:none;font-size:10px;background-color:rgba(0, 0, 0, 0.35); padding:10px;border-color:#000000;border-width:1px; font-weight:bold; margin-top:20px;border-radius: 10px;">
+  Impact Detected!
+  </div>
+  <div id="calibrationWarning" style="margin-top:20px; font-size:10px; color:#ff3333;background-color:rgba(0, 0, 0, 0.70);border-style:dashed;border-color:#ff3333;border-width:1px; padding:6px 10px; border-radius:6px; display:inline-block;">
+  <b>In-Calibration:</b> Limited to plane || MPU fixated, SVG will rotate as they hit the vertical default axis.
+  </div>
+  <div id="remainingAngles" style="margin-top:15px; font-size:12px; background-color:#00000066; padding:8px 12px; border-radius:6px; display:inline-block;">
+  <b>Remaining Range:</b><br> 
+  <span id="leftAngle">Left: --°</span> | 
+  <span id="rightAngle">Right: --°</span>
+  </div>
+  <div style="width:100%; margin-top:30px;">
+  <svg width="auto" height="300" viewBox="-25 10 150 200" preserveAspectRatio="xMidYMid meet" style="background:transparent; margin-top:20px;">
+    <!-- Hip joint -->
+    <circle cx="50" cy="20" r="5" fill="SlateBlue" />
+
+    <!-- Thigh Group -->
+    <g id="thighGroup" transform="rotate(0, 50, 20)">
+      <rect id="thigh" x="45" y="20" width="10" height="80" fill="#00ffcc" />
+    
+    <!-- Knee joint -->
+    <circle cx="50" cy="100" r="5" fill="Red" />
+
+    <!-- Knee Angle Arc -->
+    <path id="kneeAngleArc" d="" fill="none" stroke="white" stroke-width="1.5" stroke-dasharray="3,0.75" />
+    <text id="kneeAngleLabel" x="60" y="75" font-size="8" fill="white"></text>
+
+    <!-- Shin Group (nested in thigh) -->
+      <g id="shinGroup" transform="rotate(0, 50, 100)">
+        <rect x="45" y="100" width="10" height="80" fill="#ffcc00" />
+        <!-- Foot -->
+        <rect x="42.50" y="180" width="14" height="10" fill="white" />
+      </g>
+    </g>
+    <!-- Forward / Backward Direction Labels -->
+  <text id="forwardLabel" x="-20" y="210" font-size="8" fill="white" text-anchor="start"> &#x21A2 Forward</text>
+  <text id="backwardLabel" x="120" y="210" font-size="8" fill="white" text-anchor="end"> Backward &#x21A3</text>
+  </svg>
+  </div>
+<script>
+!function(t){
+  Date.now=Date.now||function(){return new Date().getTime()};var e={extend:function(){arguments[0]=arguments[0]||{};for(var t=1;t<arguments.length;t++)for(var i in arguments[t])arguments[t].hasOwnProperty(i)&&("object"==typeof arguments[t][i]?arguments[t][i]instanceof Array?arguments[0][i]=arguments[t][i]:arguments[0][i]=e.extend(arguments[0][i],arguments[t][i]):arguments[0][i]=arguments[t][i]);return arguments[0]},binarySearch:function(t,e){for(var i=0,s=t.length;i<s;){var a=i+s>>1;e<t[a][0]?s=a:i=a+1}return i},pixelSnap:function(t,e){return e%2==0?Math.round(t):Math.floor(t)+.5}};function i(t){this.options=e.extend({},i.defaultOptions,t),this.disabled=!1,this.clear()}function s(t){this.options=e.extend({},s.defaultChartOptions,t),this.seriesSet=[],this.currentValueRange=1,this.currentVisMinValue=0,this.lastRenderTimeMillis=0,this.lastChartTimestamp=0,this.mousemove=this.mousemove.bind(this),this.mouseout=this.mouseout.bind(this)}i.defaultOptions={resetBoundsInterval:3e3,resetBounds:!0},i.prototype.clear=function(){this.data=[],this.maxValue=Number.NaN,this.minValue=Number.NaN},i.prototype.resetBounds=function(){if(this.data.length){this.maxValue=this.data[0][1],this.minValue=this.data[0][1];for(var t=1;t<this.data.length;t++){var e=this.data[t][1];e>this.maxValue&&(this.maxValue=e),e<this.minValue&&(this.minValue=e)}}else this.maxValue=Number.NaN,this.minValue=Number.NaN},i.prototype.append=function(t,e,i){if(!(isNaN(t)||isNaN(e))){var s=this.data.length-1;if(s>=0)for(var a=s;;){var n=this.data[a];if(t>=n[0]){t===n[0]?i?(n[1]+=e,e=n[1]):n[1]=e:this.data.splice(a+1,0,[t,e]);break}if(--a<0){this.data.splice(0,0,[t,e]);break}}else this.data.push([t,e]);this.maxValue=isNaN(this.maxValue)?e:Math.max(this.maxValue,e),this.minValue=isNaN(this.minValue)?e:Math.min(this.minValue,e)}},i.prototype.dropOldData=function(t,e){for(var i=0;this.data.length-i>=e&&this.data[i+1][0]<t;)i++;0!==i&&this.data.splice(0,i)},s.tooltipFormatter=function(t,e){var i,a=this.options.timestampFormatter||s.timeFormatter,n=document.createElement("div");n.appendChild(document.createTextNode(a(new Date(t))));for(var o=0;o<e.length;++o){""!==(i=e[o].series.options.tooltipLabel||"")&&(i+=" ");var l=document.createElement("span");l.style.color=e[o].series.options.strokeStyle,l.appendChild(document.createTextNode(i+this.options.yMaxFormatter(e[o].value,this.options.labels.precision))),n.appendChild(document.createElement("br")),n.appendChild(l)}return n.innerHTML},s.defaultChartOptions={millisPerPixel:20,enableDpiScaling:!0,yMinFormatter:function(t,e){return parseFloat(t).toFixed(e)},yMaxFormatter:function(t,e){return parseFloat(t).toFixed(e)},yIntermediateFormatter:function(t,e){return parseFloat(t).toFixed(e)},maxValueScale:1,minValueScale:1,interpolation:"bezier",scaleSmoothing:.125,maxDataSetLength:2,scrollBackwards:!1,displayDataFromPercentile:1,grid:{fillStyle:"#000000",strokeStyle:"#777777",lineWidth:2,millisPerLine:1e3,verticalSections:2,borderVisible:!0},labels:{fillStyle:"#ffffff",disabled:!1,fontSize:10,fontFamily:"monospace",precision:2,showIntermediateLabels:!1,intermediateLabelSameAxis:!0},title:{text:"",fillStyle:"#ffffff",fontSize:15,fontFamily:"monospace",verticalAlign:"middle"},horizontalLines:[],tooltip:!1,tooltipLine:{lineWidth:1,strokeStyle:"#BBBBBB"},tooltipFormatter:s.tooltipFormatter,nonRealtimeData:!1,responsive:!1,limitFPS:0},s.AnimateCompatibility={requestAnimationFrame:function(t,e){return(window.requestAnimationFrame||window.webkitRequestAnimationFrame||window.mozRequestAnimationFrame||window.oRequestAnimationFrame||window.msRequestAnimationFrame||function(t){return window.setTimeout(function(){t(Date.now())},16)}).call(window,t,e)},cancelAnimationFrame:function(t){return(window.cancelAnimationFrame||function(t){clearTimeout(t)}).call(window,t)}},s.defaultSeriesPresentationOptions={lineWidth:1,strokeStyle:"#ffffff",fillToBottom:!0},s.prototype.addTimeSeries=function(t,i){this.seriesSet.push({timeSeries:t,options:e.extend({},s.defaultSeriesPresentationOptions,i)}),t.options.resetBounds&&t.options.resetBoundsInterval>0&&(t.resetBoundsTimerId=setInterval(function(){t.resetBounds()},t.options.resetBoundsInterval))},s.prototype.removeTimeSeries=function(t){for(var e=this.seriesSet.length,i=0;i<e;i++)if(this.seriesSet[i].timeSeries===t){this.seriesSet.splice(i,1);break}t.resetBoundsTimerId&&clearInterval(t.resetBoundsTimerId)},s.prototype.getTimeSeriesOptions=function(t){for(var e=this.seriesSet.length,i=0;i<e;i++)if(this.seriesSet[i].timeSeries===t)return this.seriesSet[i].options},s.prototype.bringToFront=function(t){for(var e=this.seriesSet.length,i=0;i<e;i++)if(this.seriesSet[i].timeSeries===t){var s=this.seriesSet.splice(i,1);this.seriesSet.push(s[0]);break}},s.prototype.streamTo=function(t,e){this.canvas=t,this.clientWidth=parseInt(this.canvas.getAttribute("width")),this.clientHeight=parseInt(this.canvas.getAttribute("height")),this.delay=e,this.start()},s.prototype.getTooltipEl=function(){return this.tooltipEl||(this.tooltipEl=document.createElement("div"),this.tooltipEl.className="smoothie-chart-tooltip",this.tooltipEl.style.pointerEvents="none",this.tooltipEl.style.position="absolute",this.tooltipEl.style.display="none",document.body.appendChild(this.tooltipEl)),this.tooltipEl},s.prototype.updateTooltip=function(){if(this.options.tooltip){var t=this.getTooltipEl();if(!this.mouseover||!this.options.tooltip){t.style.display="none";return}for(var i=this.lastChartTimestamp,s=this.options.scrollBackwards?i-this.mouseX*this.options.millisPerPixel:i-(this.clientWidth-this.mouseX)*this.options.millisPerPixel,a=[],n=0;n<this.seriesSet.length;n++){var o=this.seriesSet[n].timeSeries;if(!o.disabled){var l=e.binarySearch(o.data,s);l>0&&l<o.data.length&&a.push({series:this.seriesSet[n],index:l,value:o.data[l][1]})}}a.length?(t.innerHTML=this.options.tooltipFormatter.call(this,s,a),t.style.display="block"):t.style.display="none"}},s.prototype.mousemove=function(t){if(this.mouseover=!0,this.mouseX=t.offsetX,this.mouseY=t.offsetY,this.mousePageX=t.pageX,this.mousePageY=t.pageY,this.options.tooltip){var e=this.getTooltipEl();e.style.top=Math.round(this.mousePageY)+"px",e.style.left=Math.round(this.mousePageX)+"px",this.updateTooltip()}},s.prototype.mouseout=function(){this.mouseover=!1,this.mouseX=this.mouseY=-1,this.tooltipEl&&(this.tooltipEl.style.display="none")},s.prototype.resize=function(){var t,e,i=this.options.enableDpiScaling&&window?window.devicePixelRatio:1;this.options.responsive?(t=this.canvas.offsetWidth,e=this.canvas.offsetHeight,t!==this.lastWidth&&(this.lastWidth=t,this.canvas.setAttribute("width",Math.floor(t*i).toString()),this.canvas.getContext("2d").scale(i,i)),e!==this.lastHeight&&(this.lastHeight=e,this.canvas.setAttribute("height",Math.floor(e*i).toString()),this.canvas.getContext("2d").scale(i,i)),this.clientWidth=t,this.clientHeight=e):(t=parseInt(this.canvas.getAttribute("width")),e=parseInt(this.canvas.getAttribute("height")),1!==i?(Math.floor(this.clientWidth*i)!==t&&(this.canvas.setAttribute("width",Math.floor(t*i).toString()),this.canvas.style.width=t+"px",this.clientWidth=t,this.canvas.getContext("2d").scale(i,i)),Math.floor(this.clientHeight*i)!==e&&(this.canvas.setAttribute("height",Math.floor(e*i).toString()),this.canvas.style.height=e+"px",this.clientHeight=e,this.canvas.getContext("2d").scale(i,i))):(this.clientWidth=t,this.clientHeight=e))},s.prototype.start=function(){if(!this.frame){this.canvas.addEventListener("mousemove",this.mousemove),this.canvas.addEventListener("mouseout",this.mouseout);var t=(function(){this.frame=s.AnimateCompatibility.requestAnimationFrame((function(){if(this.options.nonRealtimeData){var e=new Date(0),i=this.seriesSet.reduce((function(t,e){var i=e.timeSeries.data,s=Math.round(this.options.displayDataFromPercentile*i.length)-1;if(s=(s=s>=0?s:0)<=i.length-1?s:i.length-1,i&&i.length>0){var a=i[s][0];t=t>a?t:a}return t}).bind(this),e);this.render(this.canvas,i>e?i:null)}else this.render();t()}).bind(this))}).bind(this);t()}},s.prototype.stop=function(){this.frame&&(s.AnimateCompatibility.cancelAnimationFrame(this.frame),delete this.frame,this.canvas.removeEventListener("mousemove",this.mousemove),this.canvas.removeEventListener("mouseout",this.mouseout))},s.prototype.updateValueRange=function(){for(var t=this.options,e=Number.NaN,i=Number.NaN,s=0;s<this.seriesSet.length;s++){var a=this.seriesSet[s].timeSeries;!a.disabled&&(isNaN(a.maxValue)||(e=isNaN(e)?a.maxValue:Math.max(e,a.maxValue)),isNaN(a.minValue)||(i=isNaN(i)?a.minValue:Math.min(i,a.minValue)))}if(null!=t.maxValue?e=t.maxValue:e*=t.maxValueScale,null!=t.minValue?i=t.minValue:i-=Math.abs(i*t.minValueScale-i),this.options.yRangeFunction){var n=this.options.yRangeFunction({min:i,max:e});i=n.min,e=n.max}if(!isNaN(e)&&!isNaN(i)){var o=e-i-this.currentValueRange,l=i-this.currentVisMinValue;this.isAnimatingScale=Math.abs(o)>.1||Math.abs(l)>.1,this.currentValueRange+=t.scaleSmoothing*o,this.currentVisMinValue+=t.scaleSmoothing*l}this.valueRange={min:i,max:e}},s.prototype.render=function(t,i){var s=this.options,a=Date.now();if(!(s.limitFPS>0)||!(a-this.lastRenderTimeMillis<1e3/s.limitFPS)){if(i=(i||a)-(this.delay||0),i-=i%s.millisPerPixel,!this.isAnimatingScale&&this.lastChartTimestamp===i&&!(a-this.lastRenderTimeMillis>1e3/6))return;this.lastRenderTimeMillis=a,this.lastChartTimestamp=i,this.resize();var n=(t=t||this.canvas).getContext("2d"),o={top:0,left:0,width:this.clientWidth,height:this.clientHeight},l=i-o.width*s.millisPerPixel,r=(function(t,i){var s=t-this.currentVisMinValue,a=0===this.currentValueRange?o.height:o.height*(1-s/this.currentValueRange);return e.pixelSnap(a,i)}).bind(this),h=function(t,a){var n=i/s.millisPerPixel-t/s.millisPerPixel,l=s.scrollBackwards?n:o.width-n;return e.pixelSnap(l,a)};if(this.updateValueRange(),n.font=s.labels.fontSize+"px "+s.labels.fontFamily,n.save(),n.translate(o.left,o.top),n.beginPath(),n.rect(0,0,o.width,o.height),n.clip(),n.save(),n.fillStyle=s.grid.fillStyle,n.clearRect(0,0,o.width,o.height),n.fillRect(0,0,o.width,o.height),n.restore(),n.save(),n.lineWidth=s.grid.lineWidth,n.strokeStyle=s.grid.strokeStyle,s.grid.millisPerLine>0){n.beginPath();for(var m=i-i%s.grid.millisPerLine;m>=l;m-=s.grid.millisPerLine){var u=h(m,s.grid.lineWidth);n.moveTo(u,0),n.lineTo(u,o.height)}n.stroke()}for(var d=1;d<s.grid.verticalSections;d++){var c=e.pixelSnap(d*o.height/s.grid.verticalSections,s.grid.lineWidth);n.beginPath(),n.moveTo(0,c),n.lineTo(o.width,c),n.stroke()}if(s.grid.borderVisible&&n.strokeRect(0,0,o.width,o.height),n.restore(),s.horizontalLines&&s.horizontalLines.length)for(var p=0;p<s.horizontalLines.length;p++){var f=s.horizontalLines[p],v=f.lineWidth||1,g=r(f.value,v);n.strokeStyle=f.color||"#ffffff",n.lineWidth=v,n.beginPath(),n.moveTo(0,g),n.lineTo(o.width,g),n.stroke()}for(var $=0;$<this.seriesSet.length;$++){var S=this.seriesSet[$].timeSeries,y=S.data;if(S.dropOldData(l,s.maxDataSetLength),!(y.length<=1)&&!S.disabled){n.save();var x=this.seriesSet[$].options,b=x.strokeStyle&&"none"!==x.strokeStyle,T=b?x.lineWidth:0;n.beginPath();var _,w=h(y[0][0],T),V=r(y[0][1],T),F=w,k=V;switch(n.moveTo(w,V),x.interpolation||s.interpolation){case"linear":case"line":_=function(t,e,i,s){n.lineTo(t,e)};break;case"bezier":default:_=function(t,e,i,s){n.bezierCurveTo(Math.round((i+t)/2),s,Math.round(i+t)/2,e,t,e)};break;case"step":_=function(t,e,i,s){n.lineTo(t,s),n.lineTo(t,e)}}for(var P=1;P<y.length;P++){var B=y[P],R=h(B[0],T),A=r(B[1],T);_(R,A,F,k),F=R,k=A}if(b&&(n.lineWidth=x.lineWidth,n.strokeStyle=x.strokeStyle,n.stroke()),x.fillStyle){var L=x.fillToBottom?o.height+T+1:r(0,0);n.lineTo(F,L),n.lineTo(w,L),n.fillStyle=x.fillStyle,n.fill()}n.restore()}}s.tooltip&&this.mouseX>=0&&(n.lineWidth=s.tooltipLine.lineWidth,n.strokeStyle=s.tooltipLine.strokeStyle,n.beginPath(),n.moveTo(this.mouseX,0),n.lineTo(this.mouseX,o.height),n.stroke()),this.updateTooltip();var W=s.labels;if(!W.disabled&&!isNaN(this.valueRange.min)&&!isNaN(this.valueRange.max)){var E=s.yMaxFormatter(this.valueRange.max,W.precision),C=s.yMinFormatter(this.valueRange.min,W.precision),z=s.scrollBackwards?0:o.width-n.measureText(E).width-2,M=s.scrollBackwards?0:o.width-n.measureText(C).width-2;n.fillStyle=W.fillStyle,n.fillText(E,z,W.fontSize),n.fillText(C,M,o.height-2)}if(W.showIntermediateLabels&&!isNaN(this.valueRange.min)&&!isNaN(this.valueRange.max)&&s.grid.verticalSections>0)for(var N=(this.valueRange.max-this.valueRange.min)/s.grid.verticalSections,H=o.height/s.grid.verticalSections,d=1;d<s.grid.verticalSections;d++){var c=o.height-Math.round(d*H),X=s.yIntermediateFormatter(this.valueRange.min+d*N,W.precision),D=W.intermediateLabelSameAxis?s.scrollBackwards?0:o.width-n.measureText(X).width-2:s.scrollBackwards?o.width-n.measureText(X).width-2:0;n.fillText(X,D,c-s.grid.lineWidth)}if(s.timestampFormatter&&s.grid.millisPerLine>0)for(var I=s.scrollBackwards?n.measureText(C).width:o.width-n.measureText(C).width+4,m=i-i%s.grid.millisPerLine;m>=l;m-=s.grid.millisPerLine){var u=h(m,0);if(!s.scrollBackwards&&u<I||s.scrollBackwards&&u>I){var O=new Date(m),q=s.timestampFormatter(O),Y=n.measureText(q).width;I=s.scrollBackwards?u+Y+2:u-Y-2,n.fillStyle=s.labels.fillStyle,s.scrollBackwards?n.fillText(q,u,o.height-2):n.fillText(q,u-Y,o.height-2)}}if(""!==s.title.text){n.font=s.title.fontSize+"px "+s.title.fontFamily;var j=s.scrollBackwards?o.width-n.measureText(s.title.text).width-2:2;if("bottom"==s.title.verticalAlign){n.textBaseline="bottom";var G=o.height}else if("middle"==s.title.verticalAlign){n.textBaseline="middle";var G=o.height/2}else{n.textBaseline="top";var G=0}n.fillStyle=s.title.fillStyle,n.fillText(s.title.text,j,G)}n.restore()}},s.timeFormatter=function(t){function e(t){return(t<10?"0":"")+t}return e(t.getHours())+":"+e(t.getMinutes())+":"+e(t.getSeconds())},t.TimeSeries=i,t.SmoothieChart=s}("undefined"==typeof exports?this:exports);
+</script>
+<script>
+  const socket = new WebSocket(`ws://${location.host}/ws`);
+  let recording = false;
+  let dataLog = [];
+  let locked = false; // Added
+
+  function toggleLock() {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.send(locked ? "unlock" : "lock");
+  }
+
+  function sendCalibration() {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send("calibrate");
+
+      const btn = document.getElementById("calibrateBtn");
+      btn.disabled = true;
+      btn.classList.add("calibrated");
+      btn.innerText = "Calibrated \u2713";
+    }
+  }
+  function formatTimestamp(ms) {
+    const d = new Date(ms);
+    return d.toISOString().replace("T", " ").split(".")[0];
+  }
+  function relativeToCalibration(angle, center = 0) {
+    let delta = angle - center;
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    return delta;
+  }
+  function drawKneeArc(centerX, centerY, thighDeg, shinDeg, radius = 20) {
+    const startAngle = thighDeg * Math.PI / 180;
+    const endAngle = shinDeg * Math.PI / 180;
+
+    const x1 = centerX + radius * Math.cos(startAngle);
+    const y1 = centerY + radius * Math.sin(startAngle);
+    const x2 = centerX + radius * Math.cos(endAngle);
+    const y2 = centerY + radius * Math.sin(endAngle);
+
+    const angleDiff = Math.abs(thighDeg - shinDeg);
+    const largeArcFlag = angleDiff > 180 ? 1 : 0;
+    const sweepFlag = (shinDeg - thighDeg + 360) % 360 > 180 ? 0 : 1;
+
+    const arcPath = `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${radius} ${radius} 0 ${largeArcFlag} ${sweepFlag} ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+
+    document.getElementById("kneeAngleArc").setAttribute("d", arcPath);
+
+    const angleLabel = Math.round(angleDiff > 180 ? 360 - angleDiff : angleDiff);
+
+    document.getElementById("kneeAngleLabel").textContent = `Deg: ${angleLabel}°`;
+    document.getElementById("kneeAngleLabel").setAttribute("x", centerX + 5);
+    document.getElementById("kneeAngleLabel").setAttribute("y", centerY - radius - 5);
+  }
+
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    if ("useCalibrated" in data) {
+      const calibBtn = document.getElementById("calibrateBtn");
+      if (data.useCalibrated) {
+        calibBtn.textContent = "Calibrated \u2713";
+        calibBtn.disabled = true;
+        calibBtn.classList.add("calibrated");
+      } else {
+        calibBtn.textContent = "Calibrate to 0";
+        calibBtn.disabled = false;
+        calibBtn.classList.remove("calibrated");
+      }
+    }
+    if ("motorLocked" in data) {
+      locked = data.motorLocked;
+      const btn = document.getElementById("lockBtn");
+      btn.innerText = locked ? "Lock" : "Unlock";
+      btn.style.backgroundColor = locked ? "red" : "green";
+      btn.style.color = "white";
+    }
+
+    document.getElementById("pitch1").textContent = (data.useCalibrated ? data.cumulativePitch1 : data.pitch1).toFixed(1);
+    document.getElementById("roll1").textContent = (data.useCalibrated ? data.cumulativeRoll1 : data.roll1).toFixed(1);
+    document.getElementById("pitch2").textContent = (data.useCalibrated ? data.cumulativePitch2 : data.pitch2).toFixed(1);
+    document.getElementById("roll2").textContent = (data.useCalibrated ? data.cumulativeRoll2 : data.roll2).toFixed(1);
+    document.getElementById("temp1").textContent = data.temp1.toFixed(0);
+    document.getElementById("temp2").textContent = data.temp2.toFixed(0);
+
+    const thigh = data.useCalibrated ? data.cumulativePitch1 : data.pitch1;
+    const shin  = data.useCalibrated ? data.cumulativeRoll2  : data.roll2;
+
+    document.getElementById("calibrationWarning").style.display = data.useCalibrated ? "block" : "none";
+
+    if (shin < -2.5) {
+      document.getElementById("forwardLabel").setAttribute("fill", "white");
+      document.getElementById("backwardLabel").setAttribute("fill", "#ff9933");
+    } else if (shin > 2.5) {
+      document.getElementById("forwardLabel").setAttribute("fill", "#ff9933");
+      document.getElementById("backwardLabel").setAttribute("fill", "white");
+    } else {
+      document.getElementById("forwardLabel").setAttribute("fill", "white");
+      document.getElementById("backwardLabel").setAttribute("fill", "white");
+    }
+
+    let insideAngle = Math.abs(thigh - shin);
+    insideAngle = insideAngle > 180 ? 360 - insideAngle : insideAngle;
+
+    drawKneeArc(50, 100, thigh, shin, 20);
+
+    document.getElementById("thighGroup").setAttribute("transform", `rotate(${thigh}, 50, 20)`);
+    document.getElementById("shinGroup").setAttribute("transform", `rotate(${shin}, 50, 100)`);
+
+    if (data.impactDetected) {
+      const alertBox = document.getElementById("impactAlert");
+      alertBox.style.display = "block";
+      alertBox.classList.add("flash");
+    } else {
+      const alertBox = document.getElementById("impactAlert");
+      alertBox.style.display = "none";
+      alertBox.classList.remove("flash");
+    }
+
+    if (data.useCalibrated) {
+      let raw = data.rawPitch1;
+
+      let remainingLeft  = Math.max(0, 90 - raw);
+      let remainingRight = Math.max(0, 90 + raw);
+
+      document.getElementById("rightAngle").textContent = `Left: ${remainingRight.toFixed(1)}°`;
+      document.getElementById("leftAngle").textContent  = `Right: ${remainingLeft.toFixed(1)}°`;
+
+      document.getElementById("leftAngle").style.color = remainingLeft < 10 ? "#ff5555" : "white";
+      document.getElementById("rightAngle").style.color = remainingRight < 10 ? "#ff5555" : "white";
+
+      document.getElementById("remainingAngles").style.display = "inline-block";
+    } else {
+      document.getElementById("remainingAngles").style.display = "none";
+    }
+
+    if (recording) {
+      const timestamp = formatTimestamp(Date.now());
+      dataLog.push(`${timestamp}, ${data.pitch1.toFixed(2)} , ${data.roll1.toFixed(2)} , ${data.pitch2.toFixed(2)} , ${data.roll2.toFixed(2)}`);
+    }
+  };
+
+  function toggleRecording() {
+    recording = !recording;
+    document.getElementById("recBtn").textContent = recording ? "Stop Recording \u23F9" : "Start Recording \u23F5";
+    if (recording) {
+      recBtn.classList.add("recording");
+    } else {
+      recBtn.classList.remove("recording");
+    }
+    if (!recording && dataLog.length > 0) {
+      document.getElementById("downloadBtn").style.display = "inline-block";
+    }
+  }
+
+  function downloadCSV() {
+    const header = "Timestamp, Pitch1, Roll1, Pitch2, Roll2\n";
+    const csvContent = header + dataLog.join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "Knee_brace(rld).csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    dataLog = [];
+    document.getElementById("downloadBtn").style.display = "none";
+  }
+    </script>
+  <script>
+  // Floating Button open/close logic
+  const floatBtn = document.getElementById('floatBtn');
+  const chartWindow = document.getElementById('chartWindow');
+  const closeChart = document.getElementById('closeChart');
+
+  // Only ONE handler with snap logic
+  floatBtn.onclick = () => {
+    chartWindow.style.display = 'block';
+    chartWindow.style.right = '32px';
+    chartWindow.style.bottom = '110px';
+    chartWindow.style.left = 'auto';
+    chartWindow.style.top = 'auto';
+  };
+  closeChart.onclick = () => chartWindow.style.display = 'none';
+
+  // ------ Smoothie Chart Setup ------
+  var chart = new SmoothieChart({
+    responsive: true,
+    millisPerPixel: 20,
+    grid: { fillStyle: '#222', strokeStyle: '#444', lineWidth: 1, millisPerLine: 1000, verticalSections: 4 },
+    labels: { fillStyle: '#fff', fontSize: 12, precision: 2 }
+  });
+  chart.streamTo(document.getElementById("chart"), 0);
+
+  // Four time series for pitch1, roll1, pitch2, roll2
+  var pitch1 = new TimeSeries();
+  var roll1  = new TimeSeries();
+  var pitch2 = new TimeSeries();
+  var roll2  = new TimeSeries();
+
+  chart.addTimeSeries(pitch1, { strokeStyle: '#00ff66', lineWidth: 2, fillStyle: 'rgba(0,255,102,0.10)' });
+  chart.addTimeSeries(roll1,  { strokeStyle: '#F0E384', lineWidth: 2, fillStyle: 'rgba(214,194,56,0.10)' });
+  chart.addTimeSeries(pitch2, { strokeStyle: '#ff9900', lineWidth: 2, fillStyle: 'rgba(255,153,0,0.10)' });
+  chart.addTimeSeries(roll2,  { strokeStyle: '#ff54c0', lineWidth: 2, fillStyle: 'rgba(255,84,192,0.10)' });
+
+  // ---- LIVE DATA: Push your ESP data here! ----
+  socket.addEventListener('message', function(event) {
+    try {
+      const data = JSON.parse(event.data);
+      let now = Date.now();
+      pitch1.append(now, data.pitch1);
+      roll1.append(now, data.roll1);
+      pitch2.append(now, data.pitch2);
+      roll2.append(now, data.roll2);
+    } catch (e) {
+      // Ignore non-data messages
+    }
+  });
+</script>
+ </body>
+</html>
+    )rawliteral");
+  });
+
+ws.onEvent([](AsyncWebSocket* server, AsyncWebSocketClient* client, AwsEventType type, void* arg, uint8_t* data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.println("WebSocket client connected");
+     clientCount++;
+    Serial.printf("Total clients: %d\n", clientCount);
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.println("WebSocket client disconnected");if (clientCount > 0) {
+      clientCount--;
+    }
+    Serial.printf("Total clients: %d\n", clientCount);
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    String msg = "";
+
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      for (size_t i = 0; i < len; i++) msg += (char)data[i];
+
+      if (msg == "calibrate") {
+        calibrateOffsets();
+      } else if (msg == "clearCalibration") {
+        clearEEPROMCalibration();
+
+        // Reset Kalman filters
+        kalmanRoll1.setEstimate(0);
+        kalmanPitch1.setEstimate(0);
+        kalmanRoll2.setEstimate(0);
+        kalmanPitch2.setEstimate(0);
+
+        // Reset offsets
+        pitchOffset1 = 0;
+        rollOffset1 = 0;
+        pitchOffset2 = 0;
+        rollOffset2 = 0;
+
+        // Reset cumulative angles (all four)
+        cumulativePitch1 = 0;
+        cumulativeRoll1  = 0;
+        cumulativePitch2 = 0;
+        cumulativeRoll2  = 0;
+
+        // Reset previous (all four)
+        prevPitch1 = 0;
+        prevRoll1  = 0;
+        prevPitch2 = 0;
+        prevRoll2  = 0;
+
+        impactDetected = false;
+        impactTime = 0;
+
+        calibrated = false;
+
+        Serial.println("Calibration cleared and system reset.");
+      } else if (msg == "lock") {
+        servo1.attach(14);  // Use your actual pin here
+        servo2.attach(12);  // Use your actual pin here
+        motorLocked = true;
+        Serial.println("Motor locked (attached)");
+        notifyClients(); 
+      } else if (msg == "unlock") {
+        servo1.detach();
+        servo2.detach();
+        motorLocked = false;
+        Serial.println("Motor unlocked (detached)");
+        notifyClients(); 
+      } else if (msg == "hardReset") {
+        Serial.println("Hard reset requested...");
+        delay(200);
+        ESP.restart();
+      }
+    }
+  }
+});
+  server.addHandler(&ws);
+  server.begin();
+}
+
+void updateServoFromKneeAngle() {
+  float thigh = pry1[1];  // Pitch1 (thigh)
+  float shin  = pry2[0];  // Roll2  (shin)
+
+  // Signed angle between thigh and shin
+  float delta1 = shin - thigh;
+  float delta2 = thigh - shin;
+
+  float kneeAngle1 = degrees(atan2(sin(radians(delta1)), cos(radians(delta1))));
+  float kneeAngle2 = degrees(atan2(sin(radians(delta2)), cos(radians(delta2))));
+
+  kneeAngle1 = constrain(kneeAngle1, -90, 90);  // Ensure within expected range
+  kneeAngle2 = constrain(kneeAngle2, -90, 90);
+
+  // Mapping -90 to 0, 0 to 90, +90 to 180
+  float servoAngle1 = ((kneeAngle1 + 90) / 180.0) * 180.0;
+  float servoAngle2 = ((kneeAngle2 + 90) / 180.0) * 180.0;
+
+  servo1.write((int)servoAngle1);
+  servo2.write((int)servoAngle2);
+}
+
+void loop() {
+  updateSensor();
+  if (motorLocked) {
+  updateServoFromKneeAngle();
+  }
+  unsigned long interval = (clientCount > 2) ? 100 : 50;
+  if (millis() - lastSend > interval) {
+    notifyClients();  // send data
+    lastSend = millis();
+  }
+}
